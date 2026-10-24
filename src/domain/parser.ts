@@ -10,6 +10,10 @@ export interface ParseResult {
 const datePattern = /\bday after tomorrow|\btomorrow\b|\btoday\b|\b(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
 const isoDatePattern = /\b\d{4}-\d{2}-\d{2}\b/;
 
+// §11: Multi-currency regex — supports INR, USD, EUR, GBP
+const moneyPattern =
+  /(?:₹|INR\s*|Rs\.?\s*)([\d,]+(?:\.\d{1,2})?)|(?:\$|USD\s*)([\d,]+(?:\.\d{1,2})?)|(?:€|EUR\s*)([\d,]+(?:\.\d{1,2})?)|(?:£|GBP\s*)([\d,]+(?:\.\d{1,2})?)/i;
+
 function inferCategory(text: string, hasAmount: boolean): Category {
   const lower = text.toLowerCase();
   if (/\b(deliver|drop off|ship|hand over|bring)\b/.test(lower)) return 'Delivery';
@@ -20,12 +24,22 @@ function inferCategory(text: string, hasAmount: boolean): Category {
   return 'Other';
 }
 
-export function parseQuickEntry(input: string, now = new Date()): ParseResult {
+/** §11: Parse quick-entry text. defaultCurrency is used when no currency symbol is found. */
+export function parseQuickEntry(input: string, now = new Date(), defaultCurrency = 'INR'): ParseResult {
   const source = input.trim();
   let working = source;
-  const money = working.match(/(?:₹|INR\s*|Rs\.?\s*)(\d[\d,]*(?:\.\d{1,2})?)/i);
-  const amount = money ? Number(money[1].replaceAll(',', '')) : null;
-  if (money) working = working.replace(money[0], ' ');
+
+  // Extract amount + detect currency from symbol
+  const money = working.match(moneyPattern);
+  let amount: number | null = null;
+  let currency = defaultCurrency;
+  if (money) {
+    if (money[1]) { amount = Number(money[1].replaceAll(',', '')); currency = 'INR'; }
+    else if (money[2]) { amount = Number(money[2].replaceAll(',', '')); currency = 'USD'; }
+    else if (money[3]) { amount = Number(money[3].replaceAll(',', '')); currency = 'EUR'; }
+    else if (money[4]) { amount = Number(money[4].replaceAll(',', '')); currency = 'GBP'; }
+    working = working.replace(money[0], ' ');
+  }
 
   const dateMatch = working.match(datePattern) ?? working.match(isoDatePattern);
   const explicitDate = dateMatch?.[0] ?? '';
@@ -59,8 +73,10 @@ export function parseQuickEntry(input: string, now = new Date()): ParseResult {
       category,
       dueDate: dueDate ?? '',
       amount: amount === null ? '' : String(amount),
-      currency: 'INR',
+      currency,
       notes: '',
+      priority: 0,
+      tags: '',
     },
     recognized,
     confidence: extracted >= 2 && title ? 'parsed' : extracted > 0 ? 'partial' : 'fallback',

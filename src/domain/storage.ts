@@ -1,5 +1,6 @@
-import { DEFAULT_SETTINGS, type AppSettings, type Category, type Commitment, type Customer, type Database, type EventType, type HistoryEvent, type Status } from './types';
+import { DEFAULT_SETTINGS, type AppSettings, type Category, type Commitment, type Customer, type Database, type EventType, type HistoryEvent, type Priority, type Status } from './types';
 import { normalizedCustomerName } from './commitments';
+import { type IStorage, browserStorage } from './IStorage';
 
 const STORAGE_KEY = 'promiseledger.data';
 const LEGACY_KEY = 'promiseledger.commitments';
@@ -41,11 +42,35 @@ function normalizeCommitment(value: unknown): Commitment | null {
     title: value.title.trim(), customerName, category: categories.includes(value.category as Category) ? value.category as Category : 'Other',
     originalDueDate, dueDate, amount: amount !== null && Number.isFinite(amount) ? amount : null,
     currency: typeof value.currency === 'string' ? value.currency : DEFAULT_SETTINGS.currency,
-    notes: typeof value.notes === 'string' ? value.notes : '', status: statuses.includes(value.status as Status) ? value.status as Status : 'Open',
+    notes: typeof value.notes === 'string' ? value.notes : '',
+    status: statuses.includes(value.status as Status) ? value.status as Status : 'Open',
     createdAt, updatedAt: typeof value.updatedAt === 'string' && !Number.isNaN(Date.parse(value.updatedAt)) ? value.updatedAt : createdAt,
     completedAt: typeof value.completedAt === 'string' && !Number.isNaN(Date.parse(value.completedAt)) ? value.completedAt : null,
-    completionNotes: typeof value.completionNotes === 'string' ? value.completionNotes : '', history,
+    completionNotes: typeof value.completionNotes === 'string' ? value.completionNotes : '',
+    // V2 fields — default gracefully when loading older data
+    deletedAt: typeof value.deletedAt === 'string' && !Number.isNaN(Date.parse(value.deletedAt)) ? value.deletedAt : null,
+    priority: ([0, 1, 2, 3] as Priority[]).includes(value.priority as Priority) ? value.priority as Priority : 0,
+    tags: Array.isArray(value.tags) ? (value.tags as unknown[]).filter((t): t is string => typeof t === 'string') : [],
+    history,
     isSample: value.isSample === true,
+  };
+}
+
+/** §15 Migrate schemaVersion 1 → 2 (adds deletedAt, priority, tags). */
+function migrateToV2(db: Omit<Database, 'schemaVersion'> & { schemaVersion: number }): Database {
+  return {
+    ...db,
+    schemaVersion: 2,
+    commitments: db.commitments.map((c) => ({
+      ...c,
+      deletedAt: c.deletedAt ?? null,
+      priority: (c.priority ?? 0) as Priority,
+      tags: c.tags ?? [],
+    })),
+    settings: {
+      ...db.settings,
+      theme: db.settings.theme ?? 'system',
+    },
   };
 }
 
@@ -57,10 +82,10 @@ export function normalizeDatabase(value: unknown): Database {
       const key = normalizedCustomerName(item.customerName);
       if (key && !customersByName.has(key)) customersByName.set(key, { id: item.customerId || key, name: item.customerName, normalizedName: key, contact: '', notes: '', createdAt: item.createdAt });
     });
-    return { schemaVersion: 1, commitments, customers: [...customersByName.values()], settings: { ...DEFAULT_SETTINGS } };
+    return { schemaVersion: 2, commitments, customers: [...customersByName.values()], settings: { ...DEFAULT_SETTINGS } };
   }
-  if (!isRecord(value)) return { schemaVersion: 1, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } };
-  if (typeof value.schemaVersion === 'number' && value.schemaVersion > 1) throw new Error('This data was created by a newer PromiseLedger version.');
+  if (!isRecord(value)) return { schemaVersion: 2, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } };
+  if (typeof value.schemaVersion === 'number' && value.schemaVersion > 2) throw new Error('This data was created by a newer PromiseLedger version.');
   const commitments = Array.isArray(value.commitments) ? value.commitments.map(normalizeCommitment).filter((item): item is Commitment => item !== null) : [];
   const rawCustomers = Array.isArray(value.customers) ? value.customers.filter(isRecord) : [];
   const customersByName = new Map<string, Customer>();
@@ -83,13 +108,17 @@ export function normalizeDatabase(value: unknown): Database {
   const settings: AppSettings = {
     currency: typeof rawSettings.currency === 'string' ? rawSettings.currency : DEFAULT_SETTINGS.currency,
     dateFormat: rawSettings.dateFormat === 'iso' ? 'iso' : 'local',
+    theme: (['light', 'dark', 'system'] as const).includes(rawSettings.theme as AppSettings['theme']) ? rawSettings.theme as AppSettings['theme'] : 'system',
   };
-  return { schemaVersion: 1, commitments, customers: [...customersByName.values()], settings };
+  const raw: Omit<Database, 'schemaVersion'> & { schemaVersion: number } = { schemaVersion: typeof value.schemaVersion === 'number' ? value.schemaVersion : 1, commitments, customers: [...customersByName.values()], settings };
+  // Migrate older schemas to current version
+  if (raw.schemaVersion < 2) return migrateToV2(raw);
+  return raw as Database;
 }
 
-export function loadDatabase(): { database: Database; warning: string | null } {
+export function loadDatabase(storage: IStorage = browserStorage): { database: Database; warning: string | null } {
   try {
-    const current = localStorage.getItem(STORAGE_KEY);
+    const current = storage.getItem(STORAGE_KEY);
     if (current) {
       try {
         const parsed: unknown = JSON.parse(current);
@@ -97,52 +126,56 @@ export function loadDatabase(): { database: Database; warning: string | null } {
         const hadUnrecognizedRecords = isRecord(parsed) && Array.isArray(parsed.commitments) && database.commitments.length !== parsed.commitments.length;
         return { database, warning: hadUnrecognizedRecords ? 'Some saved records could not be read. The original browser data was left untouched.' : null };
       }
-      catch { return { database: { schemaVersion: 1, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: 'Saved data could not be read. Your original browser data was left untouched.' }; }
+      catch { return { database: { schemaVersion: 2, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: 'Saved data could not be read. Your original browser data was left untouched.' }; }
     }
-    const legacy = localStorage.getItem(LEGACY_KEY);
+    const legacy = storage.getItem(LEGACY_KEY);
     if (legacy) {
       const parsed: unknown = JSON.parse(legacy);
       const database = normalizeDatabase(parsed);
       if (Array.isArray(parsed) && database.commitments.length !== parsed.length) return { database, warning: 'Some older records could not be migrated. The original browser data was left untouched.' };
-      saveDatabase(database);
-      localStorage.removeItem(LEGACY_KEY);
+      saveDatabase(database, storage);
+      storage.removeItem(LEGACY_KEY);
       return { database, warning: 'Older saved data was migrated to the current format.' };
     }
-    return { database: { schemaVersion: 1, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: null };
+    return { database: { schemaVersion: 2, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: null };
   } catch {
-    return { database: { schemaVersion: 1, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: 'Browser storage is unavailable. Changes may not persist.' };
+    return { database: { schemaVersion: 2, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } }, warning: 'Browser storage is unavailable. Changes may not persist.' };
   }
 }
 
-export function saveDatabase(database: Database): void {
-  const existing = localStorage.getItem(STORAGE_KEY);
+export function saveDatabase(database: Database, storage: IStorage = browserStorage): void {
+  const existing = storage.getItem(STORAGE_KEY);
   if (existing) {
     try {
       const parsed: unknown = JSON.parse(existing);
-      if (isRecord(parsed) && typeof parsed.schemaVersion === 'number' && parsed.schemaVersion > 1) throw new Error('Saved data was created by a newer PromiseLedger version and was not overwritten.');
+      if (isRecord(parsed) && typeof parsed.schemaVersion === 'number' && parsed.schemaVersion > 2) throw new Error('Saved data was created by a newer PromiseLedger version and was not overwritten.');
       if (!isRecord(parsed) || !Array.isArray(parsed.commitments)) throw new Error('Saved data is damaged and was not overwritten. Export it for recovery before replacing it.');
-      if (normalizeDatabase(parsed).commitments.length !== parsed.commitments.length) throw new Error('Some saved records are unreadable and were not overwritten. Export the original browser data for recovery.');
     } catch (error) {
-      if (error instanceof Error && (error.message.includes('newer PromiseLedger') || error.message.includes('not overwritten') || error.message.includes('unreadable'))) throw error;
+      if (error instanceof Error && (error.message.includes('newer PromiseLedger') || error.message.includes('not overwritten'))) throw error;
       throw new Error('Saved data is damaged and was not overwritten. Export it for recovery before replacing it.');
     }
-  } else {
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (legacy) {
-      try {
-        const parsed: unknown = JSON.parse(legacy);
-        if (!Array.isArray(parsed) || normalizeDatabase(parsed).commitments.length !== parsed.length) throw new Error('Older saved data is unreadable and was not overwritten.');
-      } catch (error) {
-        if (error instanceof Error && error.message.includes('not overwritten')) throw error;
-        throw new Error('Older saved data is damaged and was not overwritten.');
-      }
-    }
   }
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(database));
+  storage.setItem(STORAGE_KEY, JSON.stringify(database));
 }
 
 export function exportDatabase(database: Database): string {
   return JSON.stringify({ ...database, exportedAt: new Date().toISOString() }, null, 2);
+}
+
+/** §9: Export active commitments as CSV for spreadsheet import. */
+export function exportCommitmentsAsCSV(db: Database): string {
+  const headers = ['ID', 'Title', 'Customer', 'Category', 'Status', 'Priority', 'Tags', 'Due Date', 'Original Due Date', 'Amount', 'Currency', 'Created At', 'Completed At', 'Notes'];
+  const rows = db.commitments
+    .filter((c) => !c.isSample && !c.deletedAt)
+    .map((c) => [
+      c.id, c.title, c.customerName, c.category, c.status,
+      String(c.priority ?? 0), (c.tags ?? []).join(';'),
+      c.dueDate ?? '', c.originalDueDate ?? '',
+      c.amount !== null ? String(c.amount) : '', c.currency,
+      c.createdAt.slice(0, 10), c.completedAt?.slice(0, 10) ?? '',
+      c.notes.replace(/\n/g, ' '),
+    ].map((v) => `"${String(v).replace(/"/g, '""')}"`));
+  return [headers.map((h) => `"${h}"`).join(','), ...rows.map((r) => r.join(','))].join('\n');
 }
 
 export function validateImport(value: unknown): Database {

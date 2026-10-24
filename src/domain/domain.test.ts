@@ -7,7 +7,7 @@ import { loadDatabase, normalizeDatabase, saveDatabase, STORAGE_KEY_FOR_TESTS } 
 import type { CommitmentDraft } from './types';
 
 const sampleDraft = (overrides: Partial<CommitmentDraft> = {}): CommitmentDraft => ({
-  title: 'Deliver notebooks', customerName: 'Rahul Sharma', category: 'Delivery', dueDate: '2026-10-24', amount: '', currency: 'INR', notes: '', ...overrides,
+  title: 'Deliver notebooks', customerName: 'Rahul Sharma', category: 'Delivery', dueDate: '2026-10-24', amount: '', currency: 'INR', notes: '', priority: 0, tags: '', ...overrides,
 });
 
 describe('local calendar dates and status derivation', () => {

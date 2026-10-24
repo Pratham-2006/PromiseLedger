@@ -10,7 +10,7 @@ function shiftDate(days: number): string {
 }
 
 const draft = (values: Partial<CommitmentDraft>): CommitmentDraft => ({
-  title: '', customerName: '', category: 'Other', dueDate: '', amount: '', currency: 'INR', notes: '', ...values,
+  title: '', customerName: '', category: 'Other', dueDate: '', amount: '', currency: 'INR', notes: '', priority: 0, tags: '', ...values,
 });
 
 export function addSampleData(db: Database): Database {

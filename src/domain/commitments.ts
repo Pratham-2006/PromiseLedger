@@ -1,4 +1,4 @@
-import type { Category, Commitment, CommitmentDraft, Customer, Database, EventType, HistoryEvent, Status } from './types';
+﻿import type { Category, Commitment, CommitmentDraft, Customer, Database, EventType, HistoryEvent, Priority, Status } from './types';
 import { DEFAULT_SETTINGS } from './types';
 
 export function createId(): string {
@@ -27,6 +27,7 @@ export function createCommitment(db: Database, draft: CommitmentDraft, sample = 
   const commitmentId = createId();
   const title = draft.title.trim();
   const dueDate = draft.dueDate || null;
+  const tags = draft.tags ? draft.tags.split(',').map((t) => t.trim()).filter(Boolean) : [];
   const commitment: Commitment = {
     id: commitmentId, customerId: customer.id, title, customerName: customer.name,
     category: draft.category, originalDueDate: dueDate, dueDate,
@@ -34,6 +35,7 @@ export function createCommitment(db: Database, draft: CommitmentDraft, sample = 
     currency: draft.currency || db.settings.currency || 'INR', notes: draft.notes.trim(),
     status: 'Open', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     completedAt: null, completionNotes: '', isSample: sample,
+    deletedAt: null, priority: (draft.priority ?? 0) as Priority, tags,
     history: [],
   };
   commitment.history.push(makeEvent(commitmentId, customer.name, 'created', `Promise recorded${dueDate ? ` for ${dueDate}` : ' without a deadline'}.`));
@@ -56,7 +58,9 @@ export function updateCommitment(db: Database, id: string, patch: Partial<Commit
   const nextCategory: Category = patch.category ?? current.category;
   const nextTitle = patch.title?.trim() ?? current.title;
   const nextNotes = patch.notes === undefined ? current.notes : patch.notes.trim();
-  if (nextTitle !== current.title || nextCategory !== current.category || nextNotes !== current.notes || customer.name !== current.customerName) {
+  const nextPriority: Priority = (patch.priority ?? current.priority) as Priority;
+  const nextTags = patch.tags !== undefined ? patch.tags.split(',').map((t) => t.trim()).filter(Boolean) : current.tags;
+  if (nextTitle !== current.title || nextCategory !== current.category || nextNotes !== current.notes || customer.name !== current.customerName || nextPriority !== current.priority) {
     changes.push(makeEvent(id, customer.name, 'edited', 'Commitment details updated.'));
   }
   const amount = patch.amount === undefined ? current.amount : patch.amount.trim() ? Number(patch.amount) : null;
@@ -64,6 +68,7 @@ export function updateCommitment(db: Database, id: string, patch: Partial<Commit
     ...current,
     title: nextTitle, category: nextCategory, customerId: customer.id, customerName: customer.name,
     dueDate: nextDue, amount, currency: patch.currency ?? current.currency, notes: nextNotes,
+    priority: nextPriority, tags: nextTags,
     updatedAt: new Date().toISOString(), history: [...changes, ...current.history],
   };
   return { ...db, customers, commitments: db.commitments.map((item) => item.id === id ? updated : item) };
@@ -96,8 +101,17 @@ function patchCommitment(db: Database, id: string, patch: Partial<Commitment>): 
   return { ...db, commitments: db.commitments.map((item) => item.id === id ? { ...item, ...patch } : item) };
 }
 
+/** Soft-delete: marks deletedAt timestamp and appends a deleted event. History is preserved. */
 export function deleteCommitment(db: Database, id: string): Database {
-  return { ...db, commitments: db.commitments.filter((item) => item.id !== id) };
+  const commitment = db.commitments.find((item) => item.id === id);
+  if (!commitment) return db;
+  const event = makeEvent(id, commitment.customerName, 'deleted', 'Commitment deleted.');
+  const deleted: Commitment = {
+    ...commitment,
+    deletedAt: new Date().toISOString(),
+    history: [event, ...commitment.history],
+  };
+  return { ...db, commitments: db.commitments.map((item) => item.id === id ? deleted : item) };
 }
 
 export function updateCustomer(db: Database, id: string, patch: Partial<Pick<Customer, 'name' | 'contact' | 'notes'>>): Database {
@@ -124,5 +138,5 @@ export function updateCustomer(db: Database, id: string, patch: Partial<Pick<Cus
 }
 
 export function emptyDatabase(): Database {
-  return { schemaVersion: 1, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } };
+  return { schemaVersion: 2, commitments: [], customers: [], settings: { ...DEFAULT_SETTINGS } };
 }

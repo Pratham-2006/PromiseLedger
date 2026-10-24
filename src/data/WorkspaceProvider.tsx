@@ -283,7 +283,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (!userId) return;
     try {
       const latest = await fetchWorkspace(userId);
-      if (latest && JSON.stringify(normalizeDatabase(latest.state)) === JSON.stringify(normalizeDatabase(dbRef.current))) {
+      if (latest && latest.revision === revision.current) {
         revision.current = latest.revision; writeCloudCache(userId, latest.state, latest.revision); setSyncState('synced'); setError(null); return;
       }
       if (latest && latest.revision !== revision.current) {
