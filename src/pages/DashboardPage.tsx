@@ -59,9 +59,10 @@ interface Props {
   onCreate: (draft?: CommitmentDraft) => void;
   onOpen: (id: string) => void;
   onViewAll: () => void;
+  onLoadMockData?: () => void;
 }
 
-export function DashboardPage({ db, dateFormat, cloud, onCreate, onOpen, onViewAll }: Props) {
+export function DashboardPage({ db, dateFormat, cloud, onCreate, onOpen, onViewAll, onLoadMockData }: Props) {
   const today = localDateKey();
 
   const { open, overdue, dueToday, attention, upcoming, completedRecently } = useMemo(() => {
@@ -132,6 +133,19 @@ export function DashboardPage({ db, dateFormat, cloud, onCreate, onOpen, onViewA
           <Plus size={16} />Review promise
         </button>
       </form>
+
+      {open.length === 0 && onLoadMockData && (
+        <div className="mock-db-banner">
+          <div className="mock-db-icon"><Sparkles size={20} /></div>
+          <div className="mock-db-content">
+            <b>Explore with a Mock Shop Database</b>
+            <p>No active commitments? Populate realistic shop records (overdue delivery, payments due today, rescheduled orders, customer directory) with one click.</p>
+          </div>
+          <button className="button button-secondary button-sm" type="button" onClick={onLoadMockData}>
+            <Plus size={14} />Load Mock Data
+          </button>
+        </div>
+      )}
 
       <div className="metric-grid">
         <MetricCard icon={Activity} label="Open commitments" value={open.length} foot="Need follow-through" tone="green" onClick={onViewAll} />

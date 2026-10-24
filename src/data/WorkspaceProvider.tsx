@@ -1,8 +1,9 @@
-import { createContext, useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { CheckCheck } from 'lucide-react';
+﻿import { createContext, useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { CheckCheck, Sparkles } from 'lucide-react';
 import type { Session } from '@supabase/supabase-js';
 import { createId, normalizedCustomerName } from '../domain/commitments';
 import { emptyDatabase } from '../domain/commitments';
+import { addSampleData } from '../domain/sampleData';
 import { loadDatabase, normalizeDatabase, saveDatabase } from '../domain/storage';
 import { DEFAULT_SETTINGS, type Database } from '../domain/types';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
@@ -22,13 +23,16 @@ type WorkspaceContextValue = {
   retrySync: () => Promise<void>;
   reloadCloud: () => Promise<void>;
   overwriteCloud: () => Promise<void>;
+  switchToLocal: (seedMock?: boolean) => void;
+  switchToCloud: () => void;
 };
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 const CACHE_PREFIX = 'promiseledger.cloud-cache.';
+const LOCAL_OVERRIDE_KEY = 'promiseledger.use_local_mode';
 
 function hasLocalRecords(database: Database): boolean {
-  return database.commitments.some((item) => !item.isSample)
+  return database.commitments.some((item) => !item.isSample && !item.deletedAt)
     || database.customers.some((item) => !item.isSample)
     || database.settings.currency !== DEFAULT_SETTINGS.currency
     || database.settings.dateFormat !== DEFAULT_SETTINGS.dateFormat;
@@ -120,11 +124,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [db, setDb] = useState<Database>(localInitial.database);
   const dbRef = useRef(db);
   const [session, setSession] = useState<Session | null>(null);
-  const [authReady, setAuthReady] = useState(!isSupabaseConfigured);
+
+  const isBypassed = typeof localStorage !== 'undefined' && localStorage.getItem(LOCAL_OVERRIDE_KEY) === '1';
+  const initialMode = (!isSupabaseConfigured || isBypassed) ? 'local' : 'cloud';
+
+  const [authReady, setAuthReady] = useState(!isSupabaseConfigured || isBypassed);
   const [recoveryMode, setRecoveryMode] = useState(false);
-  const [phase, setPhase] = useState<Phase>(isSupabaseConfigured ? 'auth-loading' : 'ready');
-  const [mode, setMode] = useState<'local' | 'cloud'>(isSupabaseConfigured ? 'cloud' : 'local');
-  const [syncState, setSyncState] = useState<SyncState>(isSupabaseConfigured ? 'synced' : 'local');
+  const [phase, setPhase] = useState<Phase>((!isSupabaseConfigured || isBypassed) ? 'ready' : 'auth-loading');
+  const [mode, setMode] = useState<'local' | 'cloud'>(initialMode);
+  const [syncState, setSyncState] = useState<SyncState>(initialMode === 'cloud' ? 'synced' : 'local');
   const [error, setError] = useState<string | null>(localInitial.warning);
   const [gateError, setGateError] = useState<string | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
@@ -134,6 +142,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const writeQueue = useRef<Promise<void>>(Promise.resolve());
 
   const userId = session?.user.id ?? null;
+
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) return;
     let alive = true;
@@ -151,7 +160,16 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    if (!isSupabaseConfigured) { setMode('local'); setPhase('ready'); return; }
+    const isOverriddenLocal = localStorage.getItem(LOCAL_OVERRIDE_KEY) === '1';
+    if (!isSupabaseConfigured || isOverriddenLocal) {
+      setMode('local');
+      setPhase('ready');
+      setSyncState('local');
+      const loaded = loadDatabase().database;
+      dbRef.current = loaded;
+      setDb(loaded);
+      return;
+    }
     if (!authReady) return;
     if (!userId) {
       activeUserId.current = null;
@@ -228,6 +246,37 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     } else revision.current = pending.revision;
     try { localStorage.setItem(migrationKey(userId), '1'); } catch { /* A failed receipt write may prompt again, but never loses source data. */ }
     dbRef.current = next; setDb(next); setPhase('ready'); setSyncState('synced'); setPending(null); setMigrationBusy(false);
+  };
+
+  const switchToLocal = (seedMock = false) => {
+    localStorage.setItem(LOCAL_OVERRIDE_KEY, '1');
+    const local = loadDatabase();
+    let next = local.database;
+    if (seedMock && next.commitments.filter((c) => !c.deletedAt).length === 0) {
+      next = addSampleData(next);
+      saveDatabase(next);
+    }
+    dbRef.current = next;
+    setDb(next);
+    setMode('local');
+    setPhase('ready');
+    setSyncState('local');
+    setError(null);
+    setGateError(null);
+  };
+
+  const switchToCloud = () => {
+    localStorage.removeItem(LOCAL_OVERRIDE_KEY);
+    if (!isSupabaseConfigured) {
+      setError('Supabase is not configured yet. Add credentials to .env to enable cloud sync.');
+      return;
+    }
+    setMode('cloud');
+    if (session?.user.id) {
+      setPhase('workspace-loading');
+    } else {
+      setPhase('signed-out');
+    }
   };
 
   const apply = (change: (current: Database) => Database) => {
@@ -310,12 +359,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
   if (phase === 'auth-loading') return <CenteredPanel title="Connecting to PromiseLedger" body="Checking your secure session…" />;
   if (recoveryMode) return <PasswordRecoveryScreen onDone={() => setRecoveryMode(false)} />;
-  if (phase === 'signed-out') return <AuthScreen />;
+  if (phase === 'signed-out') return <AuthScreen onContinueLocal={switchToLocal} />;
   if (phase === 'workspace-loading') return <CenteredPanel title="Loading your workspace" body="Fetching your saved commitments…" />;
-  if (phase === 'workspace-error') return <CenteredPanel title="Workspace unavailable" body={gateError ?? 'Could not connect to Supabase.'} action={<button className="button button-primary" onClick={() => window.location.reload()}>Try again</button>} />;
+  if (phase === 'workspace-error') {
+    return (
+      <CenteredPanel
+        title="Cloud workspace unavailable"
+        body={gateError ?? 'Could not connect to Supabase.'}
+        action={
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center', marginTop: '12px' }}>
+            <button className="button button-primary" onClick={() => window.location.reload()}>Try again</button>
+            <button className="button button-secondary" onClick={() => switchToLocal(true)}>Continue with Mock Database</button>
+          </div>
+        }
+      />
+    );
+  }
   if (phase === 'migration-choice' && pending) return <MigrationChoice pending={pending} error={gateError} busy={migrationBusy} onChoose={finishChoice} />;
 
-  const value: WorkspaceContextValue = { db, apply, mode, email: session?.user.email ?? null, syncState, error, dismissError, signOut, retrySync, reloadCloud, overwriteCloud };
+  const value: WorkspaceContextValue = {
+    db, apply, mode, email: session?.user.email ?? null, syncState, error,
+    dismissError, signOut, retrySync, reloadCloud, overwriteCloud, switchToLocal, switchToCloud,
+  };
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
 }
 
@@ -329,7 +394,7 @@ function CenteredPanel({ title, body, action }: { title: string; body: string; a
   return <main className="connection-screen"><section className="connection-card"><span className="brand-mark">PL</span><h1>{title}</h1><p>{body}</p>{action}</section></main>;
 }
 
-function AuthScreen() {
+function AuthScreen({ onContinueLocal }: { onContinueLocal: (seedMock: boolean) => void }) {
   const [view, setView] = useState<'sign-in' | 'sign-up' | 'reset'>('sign-in');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -357,13 +422,46 @@ function AuthScreen() {
     finally { setBusy(false); }
   };
   const title = view === 'sign-in' ? 'Welcome back' : view === 'sign-up' ? 'Create your workspace' : 'Reset your password';
-  return <main className="connection-screen"><section className="connection-card auth-card"><span className="brand-mark"><CheckCheck size={20} /></span><div className="eyebrow">PROMISELEDGER</div><h1>{title}</h1><p>{view === 'sign-in' ? 'Sign in to keep your commitments in sync.' : view === 'sign-up' ? 'Your business commitments, available across devices.' : 'We’ll send a secure recovery link if the account exists.'}</p>
-    <form onSubmit={submit}><label>Email address<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>{view !== 'reset' && <label>Password<input type="password" autoComplete={view === 'sign-in' ? 'current-password' : 'new-password'} minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} /></label>}
-      {error && <div className="auth-error" role="alert">{error}</div>}{message && <div className="auth-message" role="status">{message}</div>}
-      <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : view === 'sign-in' ? 'Sign in' : view === 'sign-up' ? 'Create account' : 'Send reset link'}</button>
-    </form><div className="auth-links">{view === 'sign-in' && <button onClick={() => setView('reset')}>Forgot password?</button>}{view !== 'sign-in' && <button onClick={() => { setView('sign-in'); setMessage(''); setError(''); }}>Back to sign in</button>}{view !== 'sign-up' && <button onClick={() => { setView('sign-up'); setMessage(''); setError(''); }}>Create account</button>}</div>
-    <small className="auth-privacy">Your workspace is private to your account.</small>
-  </section></main>;
+  return (
+    <main className="connection-screen">
+      <section className="connection-card auth-card">
+        <span className="brand-mark"><CheckCheck size={20} /></span>
+        <div className="eyebrow">PROMISELEDGER</div>
+        <h1>{title}</h1>
+        <p>{view === 'sign-in' ? 'Sign in to keep your commitments in sync.' : view === 'sign-up' ? 'Your business commitments, available across devices.' : 'We’ll send a secure recovery link if the account exists.'}</p>
+        <form onSubmit={submit}>
+          <label>Email address<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+          {view !== 'reset' && <label>Password<input type="password" autoComplete={view === 'sign-in' ? 'current-password' : 'new-password'} minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} /></label>}
+          {error && <div className="auth-error" role="alert">{error}</div>}
+          {message && <div className="auth-message" role="status">{message}</div>}
+          <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : view === 'sign-in' ? 'Sign in' : view === 'sign-up' ? 'Create account' : 'Send reset link'}</button>
+        </form>
+        <div className="auth-links">
+          {view === 'sign-in' && <button onClick={() => setView('reset')}>Forgot password?</button>}
+          {view !== 'sign-in' && <button onClick={() => { setView('sign-in'); setMessage(''); setError(''); }}>Back to sign in</button>}
+          {view !== 'sign-up' && <button onClick={() => { setView('sign-up'); setMessage(''); setError(''); }}>Create account</button>}
+        </div>
+
+        <div className="auth-local-bypass">
+          <button
+            type="button"
+            className="button button-secondary auth-demo-btn"
+            onClick={() => onContinueLocal(true)}
+          >
+            <Sparkles size={16} /> Explore with Mock Database (Instant Demo)
+          </button>
+          <button
+            type="button"
+            className="button button-ghost"
+            style={{ width: '100%', fontSize: '11px' }}
+            onClick={() => onContinueLocal(false)}
+          >
+            Use offline on this device without an account →
+          </button>
+        </div>
+      </section>
+    </main>
+  );
 }
 
 function PasswordRecoveryScreen({ onDone }: { onDone: () => void }) {
@@ -389,8 +487,8 @@ function PasswordRecoveryScreen({ onDone }: { onDone: () => void }) {
 }
 
 function MigrationChoice({ pending, error, busy, onChoose }: { pending: { local: Database; cloud: Database; revision: number; cloudExists: boolean; localWarning: string | null }; error: string | null; busy: boolean; onChoose: (choice: 'cloud' | 'merge' | 'import' | 'empty') => Promise<void> }) {
-  const localCount = pending.local.commitments.filter((item) => !item.isSample).length;
-  const cloudCount = pending.cloud.commitments.length;
+  const localCount = pending.local.commitments.filter((item) => !item.isSample && !item.deletedAt).length;
+  const cloudCount = pending.cloud.commitments.filter((item) => !item.deletedAt).length;
   return <main className="connection-screen"><section className="connection-card migration-card"><span className="brand-mark"><CheckCheck size={20} /></span><div className="eyebrow">DATA SETUP</div><h1>{pending.cloudExists ? 'Choose which records to keep' : 'Move your local commitments?'}</h1><p>{pending.cloudExists ? `This account has ${cloudCount} cloud commitments and this browser has ${localCount} local commitments.` : `Found ${localCount} locally saved commitments. The source browser data will stay in place until you choose to remove it.`}</p>
     {pending.localWarning && <div className="auth-message" role="status">{pending.localWarning}</div>}{error && <div className="auth-error" role="alert">{error}</div>}
     <div className="migration-actions">{pending.cloudExists && <button className="button button-secondary" disabled={busy} onClick={() => void onChoose('cloud')}>Keep cloud workspace</button>}<button className="button button-primary" disabled={busy} onClick={() => void onChoose(pending.cloudExists ? 'merge' : 'import')}>{pending.cloudExists ? 'Merge local records' : 'Import local records'}</button>{!pending.cloudExists && <button className="button button-ghost" disabled={busy} onClick={() => void onChoose('empty')}>Start cloud workspace empty</button>}</div>

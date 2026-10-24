@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   BarChart2, CheckCheck, ChevronDown, History, LayoutDashboard,
   ListFilter, Menu, MoreHorizontal, Plus, Settings2, Sparkles, UsersRound, X,
@@ -66,6 +66,7 @@ function App() {
   const {
     db, apply, mode, email, syncState, error: storageError,
     dismissError, signOut, retrySync, reloadCloud, overwriteCloud,
+    switchToLocal, switchToCloud,
   } = useWorkspace();
 
   const [notice, setNotice] = useState<string | null>(null);
@@ -259,9 +260,18 @@ function App() {
               <span />
               {mode === 'local' ? 'Saved on this device' : syncState === 'saving' ? 'Syncing…' : syncState === 'offline' ? 'Offline changes' : syncState === 'conflict' ? 'Sync conflict' : 'Synced to cloud'}
             </span>
-            {mode === 'cloud' && (
-              <button className="button button-ghost button-sm sign-out-button" onClick={() => void signOut()}>
-                Sign out
+            {mode === 'cloud' ? (
+              <>
+                <button className="button button-ghost button-sm" type="button" onClick={() => switchToLocal(false)} title="Switch to local-only offline mode">
+                  Local Mode
+                </button>
+                <button className="button button-ghost button-sm sign-out-button" type="button" onClick={() => void signOut()}>
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <button className="button button-ghost button-sm" type="button" onClick={switchToCloud} title="Connect or switch to Supabase cloud account">
+                Cloud Sync
               </button>
             )}
             <button className="button button-primary button-sm" onClick={() => openCreate()}>
@@ -299,6 +309,10 @@ function App() {
               onCreate={openCreate}
               onOpen={setSelectedCommitmentId}
               onViewAll={() => setPage('commitments')}
+              onLoadMockData={() => {
+                apply(addSampleData);
+                setNotice('Sample shop database loaded! You can now explore all commitment types.');
+              }}
             />
           )}
 
