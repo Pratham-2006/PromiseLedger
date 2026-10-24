@@ -52,6 +52,14 @@ begin
     or octet_length(p_state::text) > 4000000 then
     raise exception 'invalid_workspace_state' using errcode = '22023';
   end if;
+  if p_expected_revision > 0
+    and not exists (
+      select 1
+      from public.workspace_states
+      where user_id = v_user_id
+    ) then
+    raise exception 'workspace_revision_conflict' using errcode = '40001';
+  end if;
 
   insert into public.workspace_states as current_state (user_id, state, revision, updated_at)
   values (v_user_id, p_state, 1, now())
