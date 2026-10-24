@@ -18,22 +18,23 @@ The current application is a Vite + React + TypeScript client. Its `Database` mo
 - Use versioned SQL migrations in `supabase/migrations`; never make undocumented schema-only changes in the hosted dashboard.
 - Keep sample/demo records local-only, or explicitly exclude them from normal cloud migration and sync.
 
+### Initial implementation refinement
+
+The first cloud release uses one `workspace_states` row per authenticated user with a versioned JSONB `Database` snapshot. The existing application reads and writes an aggregate `Database` and keeps lifecycle history nested in each commitment; one row lets a save or local-data migration commit atomically and keeps this MVP small. A revision-checked RPC prevents silent overwrites between tabs/devices. The normalized `customers` / `commitments` / `commitment_events` model below is a future migration option if query, reporting, or collaboration needs outgrow the single-user snapshot. It is not the first integration schema.
+
 ## Proposed database model
 
-Use UUID primary keys for cloud records. Existing local IDs may be non-UUID or derived from names, so migration must maintain an explicit old-ID-to-new-UUID map rather than assuming they can be inserted directly.
+The first schema is intentionally aligned with the current `Database` aggregate:
 
 | Table | Main columns | Purpose and constraints |
 | --- | --- | --- |
-| `customers` | `id uuid`, `user_id uuid references auth.users`, `name text`, `normalized_name text`, `contact text`, `notes text`, `created_at timestamptz`, `is_sample boolean default false` | Unique `(user_id, normalized_name)`; index `user_id`. Do not make a sample customer cloud-visible by default. |
-| `commitments` | `id uuid`, `user_id uuid references auth.users`, `customer_id uuid references customers`, `customer_name text`, `title text`, `category text`, `original_due_date date null`, `due_date date null`, `amount numeric null`, `currency text`, `notes text`, `status text`, `created_at timestamptz`, `updated_at timestamptz`, `completed_at timestamptz null`, `completion_notes text` | Keep `customer_name` as a snapshot for history/display if a customer is later renamed. Check constraints for category/status; check `amount >= 0` if the product confirms negative amounts are invalid. Index `(user_id, due_date)` and `(user_id, customer_id)`. |
-| `commitment_events` | `id uuid`, `user_id uuid`, `commitment_id uuid references commitments on delete cascade`, `customer_name text`, `type text`, `at timestamptz`, `message text`, `from_value text null`, `to_value text null`, `note text null` | One row per existing `HistoryEvent`, ordered by `at` plus `id`. The app should append lifecycle events through controlled operations; do not rewrite old events during ordinary edits. |
-| `user_settings` | `user_id uuid primary key references auth.users on delete cascade`, `currency text`, `date_format text`, `updated_at timestamptz` | Store the current per-user settings. Add a date-format check for `local`/`iso`. |
+| `workspace_states` | `user_id uuid primary key references auth.users on delete cascade`, `state jsonb`, `revision bigint`, `updated_at timestamptz` | One private current snapshot for each account. The JSON must have `schemaVersion: 1`, `commitments[]`, `customers[]`, and `settings{}`. Apply a 4 MB serialized-size limit in the initial migration. |
 
-Use `date` for due dates because they represent a local calendar day, not a point in time. Use `timestamptz` for audit events and creation/update/completion timestamps. Preserve nullable deadlines. The current derived overdue/today behavior remains client-side based on the user's local date.
+The snapshot preserves current nullable local-calendar due dates and `timestamptz` history values without lossy client-side remapping. The current derived overdue/today behavior remains client-side based on the user's local date. If the model is normalized later, use SQL `date` for deadlines and `timestamptz` for event instants.
 
 ### User ownership and RLS
 
-Enable RLS on every exposed application table. Revoke `anon` privileges and grant only required operations to `authenticated`. Add explicit, separate `SELECT`, `INSERT`, `UPDATE`, and `DELETE` policies using `user_id = (select auth.uid())`; for writes, enforce the same condition with `WITH CHECK`. For customer and event relationships, verify the referenced row belongs to the same `user_id` (using constraints/triggers or carefully designed policies) so a user cannot attach another user's customer or event to their commitment.
+Enable RLS on `workspace_states`. Revoke `anon` privileges and grant only `SELECT`, `INSERT`, and `UPDATE` to `authenticated`; add explicit policies using `user_id = (select auth.uid())` and matching `WITH CHECK` rules. The save RPC is `SECURITY INVOKER`, derives ownership from `auth.uid()`, validates the snapshot shape/size, and requires the expected revision. It must not trust a caller-provided `user_id`. Account deletion cascades the workspace row from `auth.users`.
 
 The browser's publishable key is expected to be public. It does not provide authorization; the signed-in user's access token plus database grants and RLS do. Do not depend on hidden UI controls or client-provided `user_id` values as security checks. Do not ship a service/secret key.
 
@@ -41,13 +42,12 @@ The browser's publishable key is expected to be public. It does not provide auth
 
 Introduce these boundaries before replacing persistence:
 
-1. `src/lib/supabaseClient.ts`: create one typed Supabase client, validate `import.meta.env.VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`, and export it.
-2. `src/auth/AuthProvider.tsx` (or equivalent): own session loading, sign-in state, and subscription cleanup. Keep Supabase callbacks synchronous/lightweight; do not issue nested Supabase calls from inside the auth callback.
-3. `src/data/CommitmentRepository.ts`: define domain-level operations such as `list`, `create`, `update`, `setStatus`, `recordProgress`, `delete`, customer operations, and settings operations. Provide `LocalRepository` first and `SupabaseRepository` second.
-4. `src/data/mappers.ts`: translate snake_case database rows and normalized UUIDs to the current TypeScript domain types. Validate unknown values at the boundary.
-5. React UI: represent `loading`, `ready`, `saving`, `offline`, and `error` states. Disable duplicate submits while an operation is pending and retain the user's form/input when a request fails.
+1. `src/lib/supabase.ts`: create one typed Supabase client, validate `import.meta.env.VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`, and export it.
+2. `src/data/WorkspaceProvider.tsx`: own session loading, email/password sign-up/sign-in/reset/sign-out, subscription cleanup, local migration choice, cloud cache, and save queue.
+3. Keep existing domain operations over the `Database` aggregate. Cloud reads query one row; cloud saves call one revision-checked RPC.
+4. React UI: represent `loading`, `ready`, `saving`, `offline`, and `conflict` states. Preserve local source data during first-login choices.
 
-Do not let React components call `.from(...)` directly. Keep status/deadline/history rules in domain operations or database transactions so local and cloud behavior stays consistent.
+Do not let feature components call `.from(...)` or `.rpc(...)` directly. Keep status/deadline/history rules in the domain layer; one snapshot RPC persists the resulting state atomically.
 
 ## Required client APIs
 
@@ -80,32 +80,26 @@ Provide `.env.example` containing variable names and placeholders only. Keep `.e
 
 ### Data calls
 
-All tables should include `.eq('user_id', userId)` as a defense-in-depth query filter even though RLS is mandatory. Treat the Supabase response `error` as authoritative; an empty `data` array may mean a valid empty result or an RLS-filtered result, not a successful import.
+The client adds `.eq('user_id', userId)` as a defense-in-depth filter even though RLS is mandatory. Treat Supabase errors as authoritative; a missing row is an empty workspace only when the authenticated query succeeded.
 
 | Operation | API shape |
 | --- | --- |
-| Load customers/settings | `supabase.from('customers').select('*').order('name')`; `supabase.from('user_settings').select('*').eq('user_id', userId).maybeSingle()` |
-| Load ledger page | `supabase.from('commitments').select('*, commitment_events(*)').eq('user_id', userId).order('due_date', { ascending: true, nullsFirst: false }).range(from, to)`; choose a stable tie-break order by `id`/`created_at`. |
-| Create customer/commitment | `.insert(row).select().single()`; create customer plus commitment plus initial event transactionally (see RPC below), or clearly compensate/clean up on partial failure. |
-| Edit a commitment | `.update(patch).eq('user_id', userId).eq('id', id).select().maybeSingle()`; zero returned rows must be surfaced as deleted/not accessible/concurrent change, not shown as saved. |
-| Change status, record progress, change deadline | Prefer `supabase.rpc('...')` transactional operations that update the commitment and append the event atomically. This avoids a successful status update with a missing history entry. |
-| Delete commitment | `.delete().eq('user_id', userId).eq('id', id).select('id')`; filter by both user and record ID; event rows use `ON DELETE CASCADE`. Confirm in UI and handle no affected row. |
-| Upsert settings | `.upsert(row, { onConflict: 'user_id' }).select().single()` |
-| Subscribe to future collaboration | `supabase.channel(...).on('postgres_changes', ...).subscribe()` only if multi-device/live updates are a product requirement; defer this from initial sync. |
+| Load account snapshot | `supabase.from('workspace_states').select('state, revision').eq('user_id', userId).maybeSingle()` |
+| Save initial state or mutation | `supabase.rpc('save_workspace_state', { p_state: database, p_expected_revision: revision })`; only mark synced after successful return of the next revision. |
+| Resolve ambiguous network result | Re-read the row and compare normalized state; if revision changed with different state, show an explicit reload/overwrite choice. |
+| Sign out | `supabase.auth.signOut()` after queued writes settle; clear account state from memory and scope browser cache by user ID. |
+| Live collaboration | Deferred. If needed later, add realtime subscriptions only after defining conflict resolution for the snapshot. |
 
 Check `.error` for every request. Mutations do not imply that selected rows were returned unless `.select()` is chained. Do not rely on an unfiltered `update()` or `delete()`.
 
 ### Transactional RPC functions
 
-PostgREST requests to separate tables are not one transaction. Provide narrow database functions for operations that must update a record and add its event as one unit:
+The initial integration provides one narrow function because the whole app state is saved as a single row:
 
-- `create_commitment_with_event(...)`: validate owner/customer, insert commitment, insert `created` event, return the commitment ID.
-- `update_commitment_with_event(...)`: apply allowed patch fields, append a deadline/detail event when needed, update `updated_at`, return updated row.
-- `set_commitment_status_with_event(...)`: validate state transition, update `status`, `completed_at`, and `completion_notes`, append status/completion/reopen event.
-- `record_commitment_progress(...)`: append progress event with non-empty note.
-- Optional `import_local_backup(payload jsonb)`: only if the import requirements justify it; validate all records and write the whole import transactionally under `auth.uid()`. Set a size limit and return a per-record mapping/report. Do not create a generic arbitrary-SQL or service-role endpoint.
+- `save_workspace_state(p_state jsonb, p_expected_revision bigint)`: validate the owner, schema version, required top-level shapes, and payload size; atomically insert/update the caller's row only if the expected revision matches; return the incremented revision.
+- When tables are normalized later, replace full-snapshot saves with narrow transactional functions for create/edit/status/progress/import operations.
 
-Each function must verify `auth.uid()` is non-null and enforce ownership internally, be explicitly granted only to `authenticated`, use a safe `search_path`, and never trust a caller-provided owner ID. If RPC complexity is deferred, use a database transaction implemented through a narrow Edge Function with the caller's JWT, not a browser-exposed service key.
+The function verifies `auth.uid()` is non-null, runs as invoker, is granted only to `authenticated`, uses an empty `search_path` with qualified names, and never accepts an owner ID from the client. No service key or Edge Function is part of this release.
 
 ## Local data migration and sync strategy
 
@@ -161,23 +155,22 @@ For the first release, recommend explicit one-time migration and online-only wri
 
 ### Phase 1 — Schema, migration, RLS
 
-- Add versioned migrations for tables, constraints, indexes, grants, RLS policies, and RPC functions.
-- Generate TypeScript database types from the schema and map rows into domain types.
+- Add a versioned migration for the snapshot table, grants, RLS policies, and revision-checked RPC.
+- Define TypeScript database types and validate snapshot data when it crosses the client/server boundary.
 - Add database/RLS tests for anonymous, owner, and cross-user access.
-- Acceptance: a local Supabase reset rebuilds the schema from migrations; all cross-user reads/writes fail; owner CRUD and event transaction succeed.
+- Acceptance: the migration rebuilds the schema; anonymous and cross-user reads/writes fail; a signed-in owner can save/read a full state snapshot and stale revisions are rejected.
 
 ### Phase 2 — Auth and repository boundary
 
 - Add `@supabase/supabase-js`, typed client setup, auth provider, loading/error states, sign-up, sign-in, password reset, and sign-out.
-- Add repository interfaces and keep LocalRepository behavior covered while implementing SupabaseRepository.
+- Keep the workspace provider as the temporary storage boundary; extract local/cloud repository interfaces if the app grows beyond whole-state saves.
 - Acceptance: session restore works after reload; sign-out clears account data from view; storage/account switching does not leak data; existing local-only mode still works.
 
 ### Phase 3 — Cloud CRUD and history
 
-- Route commitment, customer, history, and settings mutations through repository operations.
-- Use transactional RPC for commitment plus event changes; handle zero-row updates/deletes and retry-safe creates.
-- Add pagination where needed; do not change current UI filters/status semantics unexpectedly.
-- Acceptance: all lifecycle actions persist after reload; an event is never missing after a successful lifecycle operation; failed requests preserve user input and show an actionable error.
+- Persist all commitment, customer, settings, and history mutations through the revision-checked snapshot RPC.
+- Keep the full snapshot under the configured size limit and show save/offline/conflict states; do not silently overwrite a newer revision.
+- Acceptance: all lifecycle actions and history persist after reload; failed requests remain in a user-scoped recovery cache and expose retry/reload/overwrite actions.
 
 ### Phase 4 — Existing-data migration
 

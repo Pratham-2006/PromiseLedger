@@ -12,8 +12,9 @@ import { dateLabel, dayDistance, formatDate, isDueToday, isOverdue, localDateKey
 import { filterCommitments, type ScheduleFilter, type SortKey } from './domain/filter';
 import { parseQuickEntry } from './domain/parser';
 import { addSampleData, removeSampleData } from './domain/sampleData';
-import { exportDatabase, loadDatabase, saveDatabase, validateImport } from './domain/storage';
+import { exportDatabase, validateImport } from './domain/storage';
 import { CATEGORIES, EMPTY_DRAFT, STATUSES, type Category, type Commitment, type CommitmentDraft, type Customer, type Database, type EventType, type Status } from './domain/types';
+import { useWorkspace } from './data/WorkspaceProvider';
 
 type Page = 'dashboard' | 'commitments' | 'customers' | 'history' | 'settings';
 type ModalState = { mode: 'create' | 'edit'; id?: string; draft: CommitmentDraft } | null;
@@ -86,10 +87,8 @@ function EmptyState({ icon: Icon = CircleHelp, title, body, action }: { icon?: L
 }
 
 function App() {
-  const loaded = useMemo(loadDatabase, []);
-  const [db, setDb] = useState<Database>(loaded.database);
-  const [storageError, setStorageError] = useState<string | null>(null);
-  const [notice, setNotice] = useState(loaded.warning);
+  const { db, apply, mode, email, syncState, error: storageError, dismissError, signOut, retrySync, reloadCloud, overwriteCloud } = useWorkspace();
+  const [notice, setNotice] = useState<string | null>(null);
   const [page, setPage] = useState<Page>('dashboard');
   const [mobileMenu, setMobileMenu] = useState(false);
   const [modal, setModal] = useState<ModalState>(null);
@@ -97,14 +96,6 @@ function App() {
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
   const [customerQuery, setCustomerQuery] = useState('');
 
-  const apply = (change: (current: Database) => Database) => {
-    setDb((current) => {
-      const next = change(current);
-      try { saveDatabase(next); setStorageError(null); }
-      catch (error) { setStorageError(error instanceof Error ? error.message : 'Your browser could not save this change. Check available storage and try again.'); }
-      return next;
-    });
-  };
   const openCreate = (draft?: CommitmentDraft, customerName?: string) => {
     const value = draft ?? EMPTY_DRAFT;
     setModal({ mode: 'create', draft: { ...EMPTY_DRAFT, ...value, currency: value.amount ? value.currency : db.settings.currency, ...(customerName ? { customerName } : {}) } });
@@ -127,7 +118,7 @@ function App() {
       </nav>
       <div className="sidebar-bottom">
         <div className="sidebar-tip"><span className="tip-icon"><Sparkles size={15} /></span><strong>A promise remembered</strong><p>is trust earned.</p></div>
-        <div className="profile-row"><Avatar name="My business" size="sm" /><span><b>My business</b><small>Local workspace</small></span><MoreHorizontal size={17} className="profile-more" /></div>
+        <div className="profile-row"><Avatar name={email || 'My business'} size="sm" /><span><b>{email || 'My business'}</b><small>{mode === 'cloud' ? 'Cloud workspace' : 'Local workspace'}</small></span><MoreHorizontal size={17} className="profile-more" /></div>
       </div>
     </aside>
 
@@ -136,16 +127,16 @@ function App() {
       <header className="topbar">
         <button className="mobile-menu-button" onClick={() => setMobileMenu(true)} aria-label="Open navigation"><Menu size={20} /></button>
         <div className="breadcrumb"><span>Workspace</span><span className="crumb-sep">/</span><b>{page === 'dashboard' ? 'Dashboard' : pageTitles[page]}</b></div>
-        <div className="topbar-actions"><span className="local-badge"><span />Saved on this device</span><button className="button button-primary button-sm" onClick={() => openCreate()}><Plus size={16} />New promise</button></div>
+        <div className="topbar-actions"><span className={`local-badge ${mode === 'cloud' ? 'cloud-badge' : ''}`} title={mode === 'cloud' && email ? `Signed in as ${email}` : 'Local workspace'}><span />{mode === 'local' ? 'Saved on this device' : syncState === 'saving' ? 'Syncing…' : syncState === 'offline' ? 'Offline changes' : syncState === 'conflict' ? 'Sync conflict' : 'Synced to cloud'}</span>{mode === 'cloud' && <button className="button button-ghost button-sm sign-out-button" onClick={() => void signOut()}>Sign out</button>}<button className="button button-primary button-sm" onClick={() => openCreate()}><Plus size={16} />New promise</button></div>
       </header>
       <main className="page-content">
         {notice && <div className="notice-banner"><CheckCircle2 size={16} />{notice}<button aria-label="Dismiss" onClick={() => setNotice(null)}><X size={15} /></button></div>}
-        {storageError && <div className="notice-banner notice-error"><AlertCircle size={16} />{storageError}<button aria-label="Dismiss" onClick={() => setStorageError(null)}><X size={15} /></button></div>}
-        {page === 'dashboard' && <DashboardPage db={db} dateFormat={db.settings.dateFormat} onCreate={openCreate} onOpen={setSelectedCommitmentId} onViewAll={() => setPage('commitments')} />}
+        {storageError && <div className="notice-banner notice-error"><AlertCircle size={16} /><span>{storageError}</span>{mode === 'cloud' && syncState === 'offline' && <button className="notice-action" onClick={() => void retrySync()}>Retry sync</button>}{mode === 'cloud' && syncState === 'conflict' && <><button className="notice-action" onClick={() => void reloadCloud()}>Reload cloud</button><button className="notice-action" onClick={() => { if (window.confirm('Replace the latest cloud workspace with this device’s current copy?')) void overwriteCloud(); }}>Replace cloud</button></>}<button aria-label="Dismiss" onClick={dismissError}><X size={15} /></button></div>}
+        {page === 'dashboard' && <DashboardPage db={db} dateFormat={db.settings.dateFormat} cloud={mode === 'cloud'} onCreate={openCreate} onOpen={setSelectedCommitmentId} onViewAll={() => setPage('commitments')} />}
         {page === 'commitments' && <CommitmentsPage items={db.commitments} dateFormat={db.settings.dateFormat} onCreate={openCreate} onOpen={setSelectedCommitmentId} />}
         {page === 'customers' && <CustomersPage db={db} dateFormat={db.settings.dateFormat} selectedId={selectedCustomerId} query={customerQuery} setQuery={setCustomerQuery} onSelect={setSelectedCustomerId} onCreateFor={openCreate} onEditCustomer={(id, patch) => apply((current) => updateCustomer(current, id, patch))} onOpenCommitment={setSelectedCommitmentId} />}
         {page === 'history' && <HistoryPage db={db} />}
-        {page === 'settings' && <SettingsPage db={db} onSettings={(settings) => apply((current) => ({ ...current, settings: { ...current.settings, ...settings } }))} onLoadSamples={() => { apply(addSampleData); setNotice('Sample shop commitments added. They are marked as demo data.'); }} onRemoveSamples={() => { if (window.confirm('Remove only the sample commitments? Your own records will stay.')) { apply(removeSampleData); setNotice('Sample commitments removed.'); } }} onClear={() => { if (window.confirm('Clear all PromiseLedger records from this browser? This cannot be undone.')) { const clean = emptyDatabase(); apply(() => clean); setNotice('Local data cleared.'); } }} onImport={(imported) => { if (window.confirm('Replace the current local data with this backup? Export a copy first if you want to keep the current records.')) { apply(() => imported); setNotice('Backup imported.'); } }} />}
+        {page === 'settings' && <SettingsPage db={db} onSettings={(settings) => apply((current) => ({ ...current, settings: { ...current.settings, ...settings } }))} onLoadSamples={() => { apply(addSampleData); setNotice('Sample shop commitments added. They are marked as demo data.'); }} onRemoveSamples={() => { if (window.confirm('Remove only the sample commitments? Your own records will stay.')) { apply(removeSampleData); setNotice('Sample commitments removed.'); } }} onClear={() => { if (window.confirm(`Clear all PromiseLedger records from this ${mode === 'cloud' ? 'cloud workspace' : 'browser'}? This cannot be undone.`)) { const clean = emptyDatabase(); apply(() => clean); setNotice('PromiseLedger records cleared.'); } }} onImport={(imported) => { if (window.confirm(`Replace the current ${mode === 'cloud' ? 'cloud workspace' : 'local data'} with this backup? Export a copy first if you want to keep the current records.`)) { apply(() => imported); setNotice('Backup imported.'); } }} />}
       </main>
     </div>
     {modal && <CommitmentFormModal key={modal.mode + (modal.id ?? 'new')} initial={modal.draft} mode={modal.mode} onClose={() => setModal(null)} onSave={onSaveDraft} />}
@@ -157,7 +148,7 @@ function PageHeading({ eyebrow, title, description, action }: { eyebrow: string;
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action && <div className="heading-action">{action}</div>}</div>;
 }
 
-function DashboardPage({ db, dateFormat, onCreate, onOpen, onViewAll }: { db: Database; dateFormat: 'local' | 'iso'; onCreate: (draft?: CommitmentDraft) => void; onOpen: (id: string) => void; onViewAll: () => void }) {
+function DashboardPage({ db, dateFormat, cloud, onCreate, onOpen, onViewAll }: { db: Database; dateFormat: 'local' | 'iso'; cloud: boolean; onCreate: (draft?: CommitmentDraft) => void; onOpen: (id: string) => void; onViewAll: () => void }) {
   const today = localDateKey();
   const open = db.commitments.filter((item) => item.status === 'Open' || item.status === 'In progress');
   const overdue = open.filter((item) => isOverdue(item.dueDate, item.status, today));
@@ -204,7 +195,7 @@ function DashboardPage({ db, dateFormat, onCreate, onOpen, onViewAll }: { db: Da
       </section>
     </div>
     <section className="principle-card"><span className="principle-mark"><CheckCheck size={21} /></span><div><b>What makes a promise different?</b><p>The original deadline stays in the timeline, even when plans change. That way, your promise and reality are always visible together.</p></div><span className="principle-link">Promise → reality <ArrowRight size={14} /></span></section>
-    <div className="dashboard-footnote"><span><ShieldCheck size={14} />Your data stays on this device.</span><span>Deadlines use your local calendar date.</span></div>
+    <div className="dashboard-footnote"><span><ShieldCheck size={14} />{cloud ? 'Your data syncs to your private account.' : 'Your data stays on this device.'}</span><span>Deadlines use your local calendar date.</span></div>
   </>;
 }
 
